@@ -288,7 +288,7 @@ async def create_opportunity(opp_create: OpportunityCreate, current_user: User =
     
     opp_dict = opp_create.dict()
     opp_dict["created_by"] = current_user.id
-    opp_dict["assigned_to"] = lead["assigned_to"]
+    opp_dict["assigned_to"] = lead["assigned_to"] or current_user.id
     
     opp_obj = Opportunity(**opp_dict)
     await db.opportunities.insert_one(opp_obj.dict())
