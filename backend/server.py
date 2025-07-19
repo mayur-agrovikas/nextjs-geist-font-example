@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, File, UploadFile, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -13,6 +13,9 @@ import logging
 from pathlib import Path
 import uuid
 from enum import Enum
+import csv
+import io
+import json
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -32,7 +35,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 
 # Create the main app without a prefix
-app = FastAPI(title="CRM API", version="1.0.0")
+app = FastAPI(title="CRM API", version="2.0.0")
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
@@ -83,6 +86,12 @@ class Token(BaseModel):
     token_type: str
     user: User
 
+class LeadNote(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    content: str
+    created_by: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
 class LeadBase(BaseModel):
     name: str
     email: Optional[EmailStr] = None
@@ -95,12 +104,47 @@ class LeadBase(BaseModel):
 class LeadCreate(LeadBase):
     assigned_to: Optional[str] = None
 
+class LeadUpdate(BaseModel):
+    name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = None
+    company: Optional[str] = None
+    source: Optional[str] = None
+    notes: Optional[str] = None
+    status: Optional[LeadStatus] = None
+    assigned_to: Optional[str] = None
+
 class Lead(LeadBase):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     assigned_to: Optional[str] = None
     created_by: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
+    lead_notes: List[LeadNote] = []
+
+class LeadImport(BaseModel):
+    leads: List[Dict[str, Any]]
+    default_assigned_to: Optional[str] = None
+    assignment_map: Optional[Dict[str, str]] = None  # email -> user_id mapping
+
+class Product(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    description: Optional[str] = None
+    price: float
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class ProductCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    price: float
+
+class OpportunityProduct(BaseModel):
+    product_id: str
+    product_name: str
+    quantity: int = 1
+    unit_price: float
+    total_price: float
 
 class OpportunityBase(BaseModel):
     name: str
@@ -108,6 +152,7 @@ class OpportunityBase(BaseModel):
     stage: OpportunityStage = OpportunityStage.QUALIFIED
     expected_close_date: Optional[datetime] = None
     notes: Optional[str] = None
+    products: List[OpportunityProduct] = []
 
 class OpportunityCreate(OpportunityBase):
     lead_id: str
@@ -135,6 +180,10 @@ class CallLog(CallLogBase):
     opportunity_id: Optional[str] = None
     created_by: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class NoteCreate(BaseModel):
+    content: str
+    lead_id: str
 
 # Utility functions
 def verify_password(plain_password, hashed_password):
@@ -171,12 +220,10 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
 # Auth Routes
 @api_router.post("/auth/register", response_model=User)
 async def register(user_create: UserCreate):
-    # Check if user exists
     existing_user = await db.users.find_one({"email": user_create.email})
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already registered")
     
-    # Create user
     hashed_password = get_password_hash(user_create.password)
     user_dict = user_create.dict()
     user_dict.pop("password")
@@ -212,6 +259,44 @@ async def get_users(current_user: User = Depends(get_current_user)):
     users = await db.users.find().to_list(1000)
     return [User(**user) for user in users]
 
+# Products Routes
+@api_router.post("/products", response_model=Product)
+async def create_product(product_create: ProductCreate, current_user: User = Depends(get_current_user)):
+    if current_user.role not in [UserRole.ADMIN, UserRole.MANAGER]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    product_obj = Product(**product_create.dict())
+    await db.products.insert_one(product_obj.dict())
+    return product_obj
+
+@api_router.get("/products", response_model=List[Product])
+async def get_products(current_user: User = Depends(get_current_user)):
+    products = await db.products.find().to_list(1000)
+    return [Product(**product) for product in products]
+
+@api_router.put("/products/{product_id}", response_model=Product)
+async def update_product(product_id: str, product_update: ProductCreate, current_user: User = Depends(get_current_user)):
+    if current_user.role not in [UserRole.ADMIN, UserRole.MANAGER]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    product = await db.products.find_one({"id": product_id})
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    
+    await db.products.update_one({"id": product_id}, {"$set": product_update.dict()})
+    updated_product = await db.products.find_one({"id": product_id})
+    return Product(**updated_product)
+
+@api_router.delete("/products/{product_id}")
+async def delete_product(product_id: str, current_user: User = Depends(get_current_user)):
+    if current_user.role not in [UserRole.ADMIN, UserRole.MANAGER]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    result = await db.products.delete_one({"id": product_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return {"message": "Product deleted successfully"}
+
 # Leads Routes
 @api_router.post("/leads", response_model=Lead)
 async def create_lead(lead_create: LeadCreate, current_user: User = Depends(get_current_user)):
@@ -224,11 +309,88 @@ async def create_lead(lead_create: LeadCreate, current_user: User = Depends(get_
     await db.leads.insert_one(lead_obj.dict())
     return lead_obj
 
+@api_router.post("/leads/import")
+async def import_leads(lead_import: LeadImport, current_user: User = Depends(get_current_user)):
+    if current_user.role not in [UserRole.ADMIN, UserRole.MANAGER]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    imported_leads = []
+    errors = []
+    
+    for i, lead_data in enumerate(lead_import.leads):
+        try:
+            # Determine assignment
+            assigned_to = None
+            if lead_import.assignment_map and lead_data.get("email") in lead_import.assignment_map:
+                assigned_to = lead_import.assignment_map[lead_data["email"]]
+            elif lead_import.default_assigned_to:
+                assigned_to = lead_import.default_assigned_to
+            else:
+                assigned_to = current_user.id
+            
+            # Create lead
+            lead_dict = {
+                "name": lead_data.get("name", f"Lead {i+1}"),
+                "email": lead_data.get("email"),
+                "phone": lead_data.get("phone"),
+                "company": lead_data.get("company"),
+                "source": lead_data.get("source", "Import"),
+                "notes": lead_data.get("notes", ""),
+                "status": lead_data.get("status", "new"),
+                "assigned_to": assigned_to,
+                "created_by": current_user.id
+            }
+            
+            lead_obj = Lead(**lead_dict)
+            await db.leads.insert_one(lead_obj.dict())
+            imported_leads.append(lead_obj)
+            
+        except Exception as e:
+            errors.append(f"Row {i+1}: {str(e)}")
+    
+    return {
+        "imported_count": len(imported_leads),
+        "error_count": len(errors),
+        "errors": errors,
+        "leads": imported_leads
+    }
+
+@api_router.post("/leads/upload-csv")
+async def upload_csv_leads(file: UploadFile = File(...), default_assigned_to: Optional[str] = Form(None), current_user: User = Depends(get_current_user)):
+    if current_user.role not in [UserRole.ADMIN, UserRole.MANAGER]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="File must be a CSV")
+    
+    try:
+        content = await file.read()
+        csv_data = content.decode('utf-8')
+        csv_reader = csv.DictReader(io.StringIO(csv_data))
+        
+        leads_data = []
+        for row in csv_reader:
+            leads_data.append(dict(row))
+        
+        # Use the import function
+        lead_import = LeadImport(
+            leads=leads_data,
+            default_assigned_to=default_assigned_to
+        )
+        
+        return await import_leads(lead_import, current_user)
+        
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error processing CSV: {str(e)}")
+
 @api_router.get("/leads", response_model=List[Lead])
-async def get_leads(current_user: User = Depends(get_current_user)):
+async def get_leads(status: Optional[LeadStatus] = None, current_user: User = Depends(get_current_user)):
     query = {}
     if current_user.role == UserRole.SALES_REP:
         query = {"assigned_to": current_user.id}
+    
+    if status:
+        query["status"] = status
     
     leads = await db.leads.find(query).to_list(1000)
     return [Lead(**lead) for lead in leads]
@@ -239,26 +401,25 @@ async def get_lead(lead_id: str, current_user: User = Depends(get_current_user))
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
     
-    # Check permissions
     if current_user.role == UserRole.SALES_REP and lead["assigned_to"] != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     return Lead(**lead)
 
 @api_router.put("/leads/{lead_id}", response_model=Lead)
-async def update_lead(lead_id: str, lead_update: LeadCreate, current_user: User = Depends(get_current_user)):
+async def update_lead(lead_id: str, lead_update: LeadUpdate, current_user: User = Depends(get_current_user)):
     lead = await db.leads.find_one({"id": lead_id})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
     
-    # Check permissions
     if current_user.role == UserRole.SALES_REP and lead["assigned_to"] != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    lead_dict = lead_update.dict()
-    lead_dict["updated_at"] = datetime.utcnow()
+    # Only update fields that are provided
+    update_dict = {k: v for k, v in lead_update.dict().items() if v is not None}
+    update_dict["updated_at"] = datetime.utcnow()
     
-    await db.leads.update_one({"id": lead_id}, {"$set": lead_dict})
+    await db.leads.update_one({"id": lead_id}, {"$set": update_dict})
     updated_lead = await db.leads.find_one({"id": lead_id})
     return Lead(**updated_lead)
 
@@ -268,17 +429,51 @@ async def delete_lead(lead_id: str, current_user: User = Depends(get_current_use
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
     
-    # Check permissions
     if current_user.role == UserRole.SALES_REP and lead["assigned_to"] != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     await db.leads.delete_one({"id": lead_id})
     return {"message": "Lead deleted successfully"}
 
+# Lead Notes Routes
+@api_router.post("/leads/{lead_id}/notes", response_model=LeadNote)
+async def add_lead_note(lead_id: str, note_create: NoteCreate, current_user: User = Depends(get_current_user)):
+    lead = await db.leads.find_one({"id": lead_id})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    
+    if current_user.role == UserRole.SALES_REP and lead["assigned_to"] != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    note_dict = {
+        "content": note_create.content,
+        "created_by": current_user.id
+    }
+    note_obj = LeadNote(**note_dict)
+    
+    # Add note to lead
+    await db.leads.update_one(
+        {"id": lead_id},
+        {"$push": {"lead_notes": note_obj.dict()}}
+    )
+    
+    return note_obj
+
+@api_router.get("/leads/{lead_id}/notes", response_model=List[LeadNote])
+async def get_lead_notes(lead_id: str, current_user: User = Depends(get_current_user)):
+    lead = await db.leads.find_one({"id": lead_id})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    
+    if current_user.role == UserRole.SALES_REP and lead["assigned_to"] != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    notes = lead.get("lead_notes", [])
+    return [LeadNote(**note) for note in notes]
+
 # Opportunities Routes
 @api_router.post("/opportunities", response_model=Opportunity)
 async def create_opportunity(opp_create: OpportunityCreate, current_user: User = Depends(get_current_user)):
-    # Verify lead exists and user has access
     lead = await db.leads.find_one({"id": opp_create.lead_id})
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
@@ -289,6 +484,11 @@ async def create_opportunity(opp_create: OpportunityCreate, current_user: User =
     opp_dict = opp_create.dict()
     opp_dict["created_by"] = current_user.id
     opp_dict["assigned_to"] = lead["assigned_to"] or current_user.id
+    
+    # Calculate total value from products
+    total_value = sum(product.total_price for product in opp_create.products)
+    if total_value > 0:
+        opp_dict["value"] = total_value
     
     opp_obj = Opportunity(**opp_dict)
     await db.opportunities.insert_one(opp_obj.dict())
@@ -313,12 +513,16 @@ async def update_opportunity(opp_id: str, opp_update: OpportunityBase, current_u
     if not opp:
         raise HTTPException(status_code=404, detail="Opportunity not found")
     
-    # Check permissions
     if current_user.role == UserRole.SALES_REP and opp["assigned_to"] != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     opp_dict = opp_update.dict()
     opp_dict["updated_at"] = datetime.utcnow()
+    
+    # Recalculate total value from products
+    if opp_update.products:
+        total_value = sum(product.total_price for product in opp_update.products)
+        opp_dict["value"] = total_value
     
     await db.opportunities.update_one({"id": opp_id}, {"$set": opp_dict})
     updated_opp = await db.opportunities.find_one({"id": opp_id})
@@ -335,10 +539,15 @@ async def create_call_log(call_create: CallLogCreate, current_user: User = Depen
     return call_obj
 
 @api_router.get("/call-logs", response_model=List[CallLog])
-async def get_call_logs(current_user: User = Depends(get_current_user)):
+async def get_call_logs(lead_id: Optional[str] = None, opportunity_id: Optional[str] = None, current_user: User = Depends(get_current_user)):
     query = {}
     if current_user.role == UserRole.SALES_REP:
         query = {"created_by": current_user.id}
+    
+    if lead_id:
+        query["lead_id"] = lead_id
+    if opportunity_id:
+        query["opportunity_id"] = opportunity_id
     
     call_logs = await db.call_logs.find(query).to_list(1000)
     return [CallLog(**call) for call in call_logs]
@@ -353,10 +562,13 @@ async def get_dashboard_stats(current_user: User = Depends(get_current_user)):
     else:
         query = {}
     
-    # Lead stats
-    total_leads = await db.leads.count_documents(query)
-    new_leads = await db.leads.count_documents({**query, "status": LeadStatus.NEW})
-    qualified_leads = await db.leads.count_documents({**query, "status": LeadStatus.QUALIFIED})
+    # Lead stats by status
+    lead_stats = {}
+    for status in LeadStatus:
+        count = await db.leads.count_documents({**query, "status": status.value})
+        lead_stats[status.value] = count
+    
+    total_leads = sum(lead_stats.values())
     
     # Opportunity stats
     opp_query = query.copy() if current_user.role == UserRole.SALES_REP else {}
@@ -371,13 +583,17 @@ async def get_dashboard_stats(current_user: User = Depends(get_current_user)):
     value_result = await db.opportunities.aggregate(pipeline).to_list(1)
     total_value = value_result[0]["total_value"] if value_result else 0
     
+    # Call logs stats
+    call_query = {"created_by": current_user.id} if current_user.role == UserRole.SALES_REP else {}
+    total_calls = await db.call_logs.count_documents(call_query)
+    
     stats = {
         "total_leads": total_leads,
-        "new_leads": new_leads,
-        "qualified_leads": qualified_leads,
+        "lead_stats": lead_stats,
         "total_opportunities": total_opportunities,
         "won_opportunities": won_opportunities,
-        "total_opportunity_value": total_value
+        "total_opportunity_value": total_value,
+        "total_calls": total_calls
     }
     
     return stats
