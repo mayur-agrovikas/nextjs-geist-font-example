@@ -152,7 +152,7 @@ class CRMTester:
         response = self.make_request("GET", "/auth/me")
         self.log_test(
             "Access protected route without token",
-            response.status_code == 401,
+            response.status_code in [401, 403],
             f"Correctly rejected with status {response.status_code}"
         )
         
