@@ -100,6 +100,14 @@ class CRMTester:
                     True,
                     f"User {user_data['full_name']} registered successfully"
                 )
+            elif response.status_code == 400 and "already registered" in response.text:
+                # User already exists, just store the data for login
+                self.users[user_data["role"]] = user_data
+                self.log_test(
+                    f"Register {user_data['role']} user",
+                    True,
+                    f"User {user_data['full_name']} already exists, will use for login"
+                )
             else:
                 self.log_test(
                     f"Register {user_data['role']} user",
